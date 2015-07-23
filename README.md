@@ -25,6 +25,7 @@ Usually, we should support multi request like:
 - GET /blog/?title=hello
 - GET /blog/123/ or GET /blog/?id=123
 - GET /user/123/blog/
+
 you need **as_method** to dispatch these request to different methods:
 
 <pre>
@@ -145,20 +146,13 @@ class UserResource(rest.RestResource):
 
 ### Decorator Map
 <pre>
-app = rest.RestApp()
-
 @app.mapper('user')
 class UserResource(rest.RestResource):
-    def GET(self, id):
-        if not id:
-            raise ParamsError()
-        return {'id':id}
+    ...
 </pre>
 
 ### Function Map
 <pre>
-app = rest.RestApp()
-
 @app.mapper('user', method='GET')
 def get_user(id):
     return {'id': id}
@@ -171,7 +165,8 @@ class BlogResource(rest.RestResource):
         self.extra_result['total'] = 100
         self.extra_result['page'] = 5
         return [{'id':1}, {'id':2}]
-''' Response:
+        
+# Response:
 {
     'success': True,
     'error': None,
@@ -180,7 +175,7 @@ class BlogResource(rest.RestResource):
         'total': 100,
         'page': 5,
     },
-}'''
+}
 </pre>
 
 ### Custom Response Format
