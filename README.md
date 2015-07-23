@@ -200,8 +200,11 @@ class MyRestApp(rest.RestApp):
         return s
 </pre>
 
-
-
-
-
-
+### Params Validate
+define **_validate_x** function for param x
+<pre>
+class BlogResource(rest.Resource):
+    _validate_id = int
+    def _validate_count(self, count):
+        return int(count)
+</pre>
