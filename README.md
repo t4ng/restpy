@@ -6,6 +6,7 @@ Micro Restful API Framework in Python. Simple, Easy and Extensible
 class UserResource(rest.RestResource):
     def GET(self, id):
         return {'id': id, 'username': 'bitch'}
+
 app = rest.RestApp()
 app.map('user', UserResource)
 app.run(port=80)
