@@ -1,5 +1,5 @@
 # Restpy
-Micro Restful API Framework in Python
+Restpy is a Micro Restful API Framework in Python, which is very esay to use and extend.
 
 ## Quickstart
 <pre>
