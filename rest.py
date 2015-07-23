@@ -9,11 +9,11 @@ class RestError(Exception):
     type = 'BASE_ERROR'
     message = 'Base Rest Error Message'
 
-    def __init__(self, env=None):
-        self.env = env
+    def __init__(self, detail=None):
+        self.detail = detail
 
     def to_dict(self):
-        return dict(type=self.type, message=self.message, env=self.env)
+        return dict(type=self.type, message=self.message, detail=self.detail)
 
 class PolyMethod(object):
     def __init__(self, name):
@@ -21,6 +21,8 @@ class PolyMethod(object):
         self._fs = []
 
     def __call__(self, *args, **kwargs):
+        if len(self._fs) == 1:
+            return self._fs[0](*args, **kwargs)
         for f in self._fs:
             if f._required_args.issubset(set(kwargs.keys())):
                 return f(*args, **kwargs)
@@ -41,6 +43,11 @@ class RestResource(object):
             ploy_method = getattr(self, f._method, PolyMethod(f._method))
             ploy_method.add(f)
             setattr(self, f._method, ploy_method)
+
+    def validate_params(self, params):
+        for name in params.keys():
+            validater = getattr(self, '_validate_'+name, None)
+            if validater: params[name] = validater(params[name])
 
 def as_method(method):
     def decorator(f):
@@ -65,9 +72,12 @@ def parse_wsgi_environ(environ):
 
     method = environ['REQUEST_METHOD'].upper()
     path = environ['PATH_INFO'].lower()
-    params = _parse_json(environ['wsgi.input'].read())
-    params.update(_parse_qs(environ['QUERY_STRING']))
+    body = environ['wsgi.input'].read()
+    query_str = environ['QUERY_STRING']
     headers = {k[5:]: v for k, v in environ.iteritems() if k.startswith('HTTP_')}
+
+    params = _parse_json(body)
+    params.update(_parse_qs(query_str))
     return dict(method=method, path=path, params=params, headers=headers)
 
 class RestApp(object):
@@ -109,6 +119,7 @@ class RestApp(object):
         parts = [part.strip().lower() for part in path.split('/')]
         parts = filter(lambda x: len(x) > 0, parts)
         if not parts: return None, None, {}
+
         if parts[-1].startswith('_'):
             method_override = parts.pop()[1:]
         if len(parts) % 2 == 0:
@@ -117,6 +128,7 @@ class RestApp(object):
         extra_params.update({parts[i*2]+'_id': self.to_id(parts[i*2+1]) for i in range(len(parts)/2)})
         if None in extra_params.values():
             return None, None, {}
+
         return endpoint, method_override, extra_params
 
     def make_response(self, result=None, extra_result=None, error=None):
@@ -133,12 +145,16 @@ class RestApp(object):
         rclass = self.mapping.get(endpoint)
         if not rclass:
             return {}
+
         resource = rclass(context) if issubclass(rclass, RestResource) else rclass()
         method = method_override or method
         params.update(extra_params)
         to_call = getattr(resource, method.upper(), None)
         if not callable(to_call):
             return {}
+
+        if isinstance(resource, RestResource):
+            resource.validate_params(params)
         result, error = None, None
         try:
             result = to_call(**params)
