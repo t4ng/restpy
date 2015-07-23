@@ -1,5 +1,5 @@
 # Restpy
-Restpy is a Micro Restful API Framework in Python, which is very esay to use and extend.
+Micro Restful API Framework in Python. Simple, Easy and Extensible
 
 ## Quickstart
 <pre>
@@ -48,11 +48,11 @@ In Restful, there's only standard HTTP Method is supported, but sometimes it's h
 - POST /blog/123/digg
 - POST /user/123/follow
 
-but its hard to distinguish them with resouce endpoint. So we create a convention: all the custom method shoud starts with underline, like this:
+but its hard to distinguish them with resouce endpoint. So we make a convention: all the custom method shoud starts with underline, like this:
 - POST /blog/123/_digg
 - POST /user/123/_follow
 
-then Restpy will route it to the correct method is resource class.
+then Restpy will route it to the correct method in resource class.
 
 <pre>
 class BlogResource(rest.RestResource):
