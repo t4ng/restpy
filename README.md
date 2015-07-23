@@ -1,9 +1,6 @@
 # Restpy
 Micro Restful API Framework in Python
 
-## Introductoin
-Restpy is a simple Restful API Framework which is very easy to use and extend.
-
 ## Quickstart
 <pre>
 class UserResource(rest.RestResource):
@@ -15,7 +12,7 @@ app.map('user', UserResource)
 app.run(port=80)
 </pre>
 
-## Second Level Endpoint
+## Multi-Level Endpoint
 For example: when request **GET /user/123/blog/**, you need **user_id** in arguments
 <pre>
 class BlogResource(rest.RestResource):
