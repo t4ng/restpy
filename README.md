@@ -9,7 +9,7 @@ class UserResource(rest.RestResource):
 app = rest.RestApp()
 app.map('user', UserResource)
 app.run(port=80)
-```python
+```
 
 ## Multi-Level Endpoint
 For example: when request **GET /user/123/blog/**, you need **user_id** in arguments
