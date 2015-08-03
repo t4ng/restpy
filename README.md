@@ -28,16 +28,17 @@ Usually, we should support multi request like:
 
 you need **as_method** to dispatch these request to different methods:
 ```python
-class BlogResource(rest.RestResource):
-    @rest.as_method('GET')
+from rest import RestResource, as_method
+class BlogResourceRestResource):
+    @as_method('GET')
     def get_one(self, id):
         return {'id': id}
     
-    @rest.as_method('GET')
+    @as_method('GET')
     def get_by_title(self, title):
         return {'id':1, 'title':title}
         
-    @rest.as_method('GET')
+    @as_method('GET')
     def get_by_user(self, user_id):
         return [{'id':1}, {'id':2}]
 ```
