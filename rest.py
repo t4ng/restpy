@@ -4,7 +4,7 @@
 
 import json
 import inspect
-import datetime
+import functools
 
 class NOT_SET(object):
     pass
@@ -27,9 +27,11 @@ class PolyMethod(object):
         self._fs.sort(key=lambda x: len(x._required_args), reverse=True)
 
 class StrongArg(object):
-    def __init__(self, type, default=NOT_SET):
+    def __init__(self, type, default=NOT_SET, desc='-'):
         self.type = type
         self.default = default
+        self.required = default != NOT_SET
+        self.desc = desc
 
     def validate(self, value):
         if isinstance(value, self.type):
@@ -37,7 +39,8 @@ class StrongArg(object):
         return self.type(value)
 
 def be_strong(f):
-    spec = inspect.getargspec(f)
+    try: spec = inspect.getargspec(f)
+    except: return f
     if not spec.defaults:
         return f
     strong_args = {}
@@ -55,12 +58,12 @@ def be_strong(f):
             real_defaults.append(d)
     if not strong_args:
         return f
-    f._strong_args = strong_args
-    f._real_defaults = tuple(real_defaults)
     if hasattr(f, '__func__'):
-        f.__func__.func_defaults = f._real_defaults
+        f.__func__.func_defaults = tuple(real_defaults)
     else:
-        f.func_defaults = f._real_defaults
+        f.func_defaults = tuple(real_defaults)
+
+    @functools.wraps(f)
     def wrapper(*args, **kwargs):
         kwargs.update(dict(zip(spec.args, args)))
         for name, value in kwargs.items():
@@ -68,6 +71,11 @@ def be_strong(f):
             if strong_arg:
                 kwargs[name] = strong_arg.validate(value)
         return f(**kwargs)
+
+    wrapper._strong_args = strong_args
+    for p in dir(f):
+        if p[0] == '_' and p[1] != '_':
+            setattr(wrapper, p, getattr(f, p))
     return wrapper
 
 class RestError(Exception):
@@ -80,15 +88,15 @@ class RestError(Exception):
     def to_dict(self):
         return dict(type=self.type, message=self.message, detail=self.detail)
 
-class MetaRestResource(type):
+class RestResourceMeta(type):
     def __new__(cls, name, bases, attrs):
         for k, v in attrs.items():
-            if hasattr(v, '__func__'):
+            if callable(v):
                 attrs[k] = be_strong(v)
         return type.__new__(cls, name, bases, attrs)
 
 class RestResource(object):
-    __metaclass__ = MetaRestResource
+    __metaclass__ = RestResourceMeta
 
     def __init__(self, context=None):
         self.context = context
@@ -103,7 +111,7 @@ class RestResource(object):
 
     def validate_params(self, params):
         for name in params.keys():
-            validator = self._params.get(name)
+            validator = getattr(self, '_validate_'+name, None)
             if validator: params[name] = validator(params[name])
 
 def as_method(method):
@@ -209,17 +217,61 @@ class RestApp(object):
         to_call = getattr(resource, method.upper(), None)
         if not callable(to_call):
             return {}
-
-        if isinstance(resource, RestResource):
-            resource.validate_params(params)
         result, error = None, None
         try:
+            if isinstance(resource, RestResource):
+                resource.validate_params(params)
             result = to_call(**params)
         except RestError as ex:
             error = ex
         extra_result = getattr(resource, 'extra_result', None)
         response = self.make_response(result, extra_result, error)
         return response
+
+    def get_schema(self):
+        schema = {}
+        for endpoint, rc in self.mapping.iteritems():
+            rc_schema = {
+                'desc': rc.__doc__ or '-',
+                'methods': [],
+            }
+            fs = [getattr(rc, p) for p in dir(rc)]
+            fs = [f for f in fs if hasattr(f, 'im_func')]
+            for f in fs:
+                if hasattr(f, '_method'):
+                    name = f._method
+                elif f.im_func.func_name.isupper():
+                    name = f.im_func.func_name
+                else:
+                    continue
+                args = getattr(f, '_strong_args', {})
+                args = [(k, v.required, v.type, v.desc) for k, v in args.iteritems()]
+                mt_schema = {
+                    'name': name,
+                    'desc': f.__doc__ or '-',
+                    'args': args,
+                }
+                rc_schema['methods'].append(mt_schema)
+            schema[endpoint] = rc_schema
+        return schema
+
+    def to_doc(self):
+        schema = self.get_schema()
+        doc = []
+        for endpoint, rc_schema in schema.iteritems():
+            doc.append('#'+endpoint)
+            doc.append(rc_schema['desc'])
+            for mt_schema in rc_schema['methods']:
+                doc.append('##'+mt_schema['name'])
+                doc.append(mt_schema['desc'])
+                if mt_schema['args']:
+                    table = [
+                        'arg | required | type | description',
+                        '-- | -- | -- | --',
+                    ]
+                    table += [' | '.join(map(lambda x:str(x).strip('<>'), a)) for a in mt_schema['args']]
+                    doc.append('\n'.join(table))
+        return '\n\n'.join(filter(lambda x: len(x) > 0, doc)) + '\n'
 
 class RestClient(object):
     def __init__(self, base_url, headers={}, pool_size=4, retries=0):
