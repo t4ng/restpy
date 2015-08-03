@@ -117,9 +117,12 @@ class RestResource(object):
 def as_method(method):
     def decorator(f):
         spec = inspect.getargspec(f)
-        end_idx = -len(spec.defaults) if spec.defaults else len(spec.args)
+        defaults = list(spec.defaults) if spec.defaults else []
+        if defaults:
+            while defaults and getattr(defaults[0], 'default', None) == NOT_SET:
+                defaults.pop(0)
         f._method = method
-        f._required_args = set(spec.args[1:end_idx])
+        f._required_args = set(spec.args[1:len(spec.args)-len(defaults)])
         return f
     return decorator
 
