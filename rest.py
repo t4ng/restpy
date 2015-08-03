@@ -4,16 +4,10 @@
 
 import json
 import inspect
+import datetime
 
-class RestError(Exception):
-    type = 'BASE_ERROR'
-    message = 'Base Rest Error Message'
-
-    def __init__(self, detail=None):
-        self.detail = detail
-
-    def to_dict(self):
-        return dict(type=self.type, message=self.message, detail=self.detail)
+class NOT_SET(object):
+    pass
 
 class PolyMethod(object):
     def __init__(self, name):
@@ -30,9 +24,72 @@ class PolyMethod(object):
 
     def add(self, f):
         self._fs.append(f)
-        self._fs.sort(key=lambda x:len(x._required_args), reverse=True)
+        self._fs.sort(key=lambda x: len(x._required_args), reverse=True)
+
+class StrongArg(object):
+    def __init__(self, type, default=NOT_SET):
+        self.type = type
+        self.default = default
+
+    def validate(self, value):
+        if isinstance(value, self.type):
+            return value
+        return self.type(value)
+
+def be_strong(f):
+    spec = inspect.getargspec(f)
+    if not spec.defaults:
+        return f
+    strong_args = {}
+    real_defaults = []
+    required_count = len(spec.args) - len(spec.defaults)
+    for i, d in enumerate(spec.defaults):
+        if isinstance(d, StrongArg):
+            arg_name = spec.args[required_count+i]
+            strong_args[arg_name] = d
+            if d.default != NOT_SET:
+                real_defaults.append(d.default)
+            if real_defaults and d.default == NOT_SET:
+                raise SyntaxError('non-default argument follows default argument')
+        else:
+            real_defaults.append(d)
+    if not strong_args:
+        return f
+    f._strong_args = strong_args
+    f._real_defaults = tuple(real_defaults)
+    if hasattr(f, '__func__'):
+        f.__func__.func_defaults = f._real_defaults
+    else:
+        f.func_defaults = f._real_defaults
+    def wrapper(*args, **kwargs):
+        kwargs.update(dict(zip(spec.args, args)))
+        for name, value in kwargs.items():
+            strong_arg = strong_args.get(name)
+            if strong_arg:
+                kwargs[name] = strong_arg.validate(value)
+        return f(**kwargs)
+    return wrapper
+
+class RestError(Exception):
+    type = 'BASE_ERROR'
+    message = 'Base Rest Error Message'
+
+    def __init__(self, detail=None):
+        self.detail = detail
+
+    def to_dict(self):
+        return dict(type=self.type, message=self.message, detail=self.detail)
+
+class MetaRestResource(type):
+    def __new__(cls, name, bases, attrs):
+        for k, v in attrs.items():
+            if hasattr(v, '__func__'):
+                attrs[k] = be_strong(v)
+        return type.__new__(cls, name, bases, attrs)
 
 class RestResource(object):
+    __metaclass__ = MetaRestResource
+
     def __init__(self, context=None):
         self.context = context
         self.extra_result = {}
@@ -46,8 +103,8 @@ class RestResource(object):
 
     def validate_params(self, params):
         for name in params.keys():
-            validater = getattr(self, '_validate_'+name, None)
-            if validater: params[name] = validater(params[name])
+            validator = self._params.get(name)
+            if validator: params[name] = validator(params[name])
 
 def as_method(method):
     def decorator(f):
@@ -163,3 +220,60 @@ class RestApp(object):
         extra_result = getattr(resource, 'extra_result', None)
         response = self.make_response(result, extra_result, error)
         return response
+
+class RestClient(object):
+    def __init__(self, base_url, headers={}, pool_size=4, retries=0):
+        import requests
+        self.base_url = base_url
+        self.headers = headers
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_maxsize=pool_size,
+            pool_connections=pool_size,
+            max_retries=retries
+        )
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        self.session = session
+
+    def request(self, method, path, params):
+        url = self.base_url.rstrip('/') + '/' + path.strip('/') + '/'
+        if method not in {'GET', 'POST', 'PUT', 'PATCH', 'DELETE'}:
+            url = url.rstrip('/') + '/_' + method.lower() + '/'
+            method = 'POST'
+        if method != 'GET':
+            data = json.dumps(params)
+            params = {}
+        else:
+            data = None
+        try:
+            resp = self.session.request(method, url, params=params, data=data, headers=self.headers)
+            resp = resp.json()
+        except:
+            return {}
+        return resp
+
+    def __getattr__(self, name):
+        def _method(path, params):
+            return self.request(name, path, params)
+        if name.isupper():
+            return _method
+        raise AttributeError
+
+    class RC(object):
+        def __init__(self, client, endpoint):
+            self.client = client
+            self.endpoint = endpoint
+
+        def __getattr__(self, name):
+            def _method(**params):
+                return self.client.request(name, self.endpoint, params)
+            if name.isupper():
+                return _method
+            raise AttributeError
+
+    def new_rc(self, endpoint):
+        return self.RC(self, endpoint)
+
+
+
