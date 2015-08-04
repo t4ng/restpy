@@ -29,7 +29,8 @@ Usually, we should support multi request like:
 you need **as_method** to dispatch these request to different methods:
 ```python
 from rest import RestResource, as_method
-class BlogResourceRestResource):
+
+class BlogResource(RestResource):
     @as_method('GET')
     def get_one(self, id):
         return {'id': id}
