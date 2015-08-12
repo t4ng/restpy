@@ -26,17 +26,52 @@ class PolyMethod(object):
         self._fs.append(f)
         self._fs.sort(key=lambda x: len(x._required_args), reverse=True)
 
-class StrongArg(object):
-    def __init__(self, type, default=NOT_SET, desc='-'):
-        self.type = type
+class BaseStrongArg(object):
+    type = object
+
+    def __init__(self, default=NOT_SET, desc='-'):
         self.default = default
-        self.required = default != NOT_SET
+        self.required = (default == NOT_SET)
         self.desc = desc
 
     def validate(self, value):
         if isinstance(value, self.type):
             return value
         return self.type(value)
+
+IntArg = type('IntArg', (BaseStrongArg,), dict(type=int))
+StrArg = type('StrArg', (BaseStrongArg,), dict(type=str))
+BoolArg = type('BoolArg', (BaseStrongArg,), dict(type=bool))
+
+class ListArg(BaseStrongArg):
+    type = list
+
+    def validate(self, value):
+        if not isinstance(value, list):
+            raise ValueError('Except list')
+        return value
+
+class IntListArg(BaseStrongArg):
+    type = list
+
+    def validate(self, value):
+        if not isinstance(value, list):
+            raise ValueError('Expect int list')
+        for i in value:
+            if not isinstance(i, (int, long)):
+                raise ValueError('Expect int list')
+        return value
+
+class StrListArg(BaseStrongArg):
+    type = list
+
+    def validate(self, value):
+        if not isinstance(value, list):
+            raise ValueError('Expect int list')
+        for i in value:
+            if not isinstance(i, basestring):
+                raise ValueError('Expect int list')
+        return value
 
 def be_strong(f):
     try: spec = inspect.getargspec(f)
@@ -47,7 +82,7 @@ def be_strong(f):
     real_defaults = []
     required_count = len(spec.args) - len(spec.defaults)
     for i, d in enumerate(spec.defaults):
-        if isinstance(d, StrongArg):
+        if isinstance(d, BaseStrongArg):
             arg_name = spec.args[required_count+i]
             strong_args[arg_name] = d
             if d.default != NOT_SET:
@@ -63,16 +98,19 @@ def be_strong(f):
     else:
         f.func_defaults = tuple(real_defaults)
 
+    f._strong_args = strong_args
+    f._args = spec.args
+    f._defaults = real_defaults
+
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        kwargs.update(dict(zip(spec.args, args)))
+        kwargs.update(dict(zip(f._args, args)))
         for name, value in kwargs.items():
-            strong_arg = strong_args.get(name)
+            strong_arg = f._strong_args.get(name)
             if strong_arg:
                 kwargs[name] = strong_arg.validate(value)
         return f(**kwargs)
 
-    wrapper._strong_args = strong_args
     for p in dir(f):
         if p[0] == '_' and p[1] != '_':
             setattr(wrapper, p, getattr(f, p))
@@ -231,51 +269,6 @@ class RestApp(object):
         response = self.make_response(result, extra_result, error)
         return response
 
-    def get_schema(self):
-        schema = {}
-        for endpoint, rc in self.mapping.iteritems():
-            rc_schema = {
-                'desc': rc.__doc__ or '-',
-                'methods': [],
-            }
-            fs = [getattr(rc, p) for p in dir(rc)]
-            fs = [f for f in fs if hasattr(f, 'im_func')]
-            for f in fs:
-                if hasattr(f, '_method'):
-                    name = f._method
-                elif f.im_func.func_name.isupper():
-                    name = f.im_func.func_name
-                else:
-                    continue
-                args = getattr(f, '_strong_args', {})
-                args = [(k, v.required, v.type, v.desc) for k, v in args.iteritems()]
-                mt_schema = {
-                    'name': name,
-                    'desc': f.__doc__ or '-',
-                    'args': args,
-                }
-                rc_schema['methods'].append(mt_schema)
-            schema[endpoint] = rc_schema
-        return schema
-
-    def to_doc(self):
-        schema = self.get_schema()
-        doc = []
-        for endpoint, rc_schema in schema.iteritems():
-            doc.append('#'+endpoint)
-            doc.append(rc_schema['desc'])
-            for mt_schema in rc_schema['methods']:
-                doc.append('##'+mt_schema['name'])
-                doc.append(mt_schema['desc'])
-                if mt_schema['args']:
-                    table = [
-                        'arg | required | type | description',
-                        '-- | -- | -- | --',
-                    ]
-                    table += [' | '.join(map(lambda x:str(x).strip('<>'), a)) for a in mt_schema['args']]
-                    doc.append('\n'.join(table))
-        return '\n\n'.join(filter(lambda x: len(x) > 0, doc)) + '\n'
-
 class RestClient(object):
     def __init__(self, base_url, headers={}, pool_size=4, retries=0):
         import requests
@@ -314,21 +307,3 @@ class RestClient(object):
         if name.isupper():
             return _method
         raise AttributeError
-
-    class RC(object):
-        def __init__(self, client, endpoint):
-            self.client = client
-            self.endpoint = endpoint
-
-        def __getattr__(self, name):
-            def _method(**params):
-                return self.client.request(name, self.endpoint, params)
-            if name.isupper():
-                return _method
-            raise AttributeError
-
-    def new_rc(self, endpoint):
-        return self.RC(self, endpoint)
-
-
-
