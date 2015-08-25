@@ -116,7 +116,7 @@ def be_strong(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         kwargs.update(dict(zip(spec.args, args)))
-        for name, value in kwargs.items():
+        for name, value in list(kwargs.items()):
             strong_arg = f._strong_args.get(name)
             if strong_arg:
                 kwargs[name] = strong_arg.validate(value)
@@ -159,9 +159,9 @@ class RestResource(object):
             setattr(self, f._method, ploy_method)
 
     def validate_params(self, params):
-        for name in params.keys():
-            validator = getattr(self, '_validate_'+name, None)
-            if validator: params[name] = validator(params[name])
+        for name in list(params.keys()):
+            validator = getattr(self, '_validate_'+name, lambda x: x)
+            params[name] = validator(params[name])
 
 def _parse_wsgi_environ(environ):
     def _parse_json(s):
@@ -176,7 +176,7 @@ def _parse_wsgi_environ(environ):
     path = environ['PATH_INFO'].lower()
     body = environ['wsgi.input'].read()
     query_str = environ['QUERY_STRING']
-    headers = {k[5:]: v for k, v in environ.iteritems() if k.startswith('HTTP_')}
+    headers = {k[5:]: v for k, v in environ.items() if k.startswith('HTTP_')}
 
     params = _parse_json(body)
     params.update(_parse_qs(query_str))
@@ -270,7 +270,7 @@ class RestApp(object):
 
     def get_schema(self):
         apis = []
-        for endpoint, rclass in self.mapping.iteritems():
+        for endpoint, rclass in self.mapping.items():
             fs = [getattr(rclass, p) for p in dir(rclass) if not p.startswith('_')]
             fs = filter(lambda x: hasattr(x, '__func__') and \
                 hasattr(x, '_strong_args') and \
@@ -278,7 +278,7 @@ class RestApp(object):
             for f in fs:
                 method = getattr(f, '_method', f.__func__.__name__)
                 parameters = []
-                for arg_name, strong_arg in f._strong_args.iteritems():
+                for arg_name, strong_arg in f._strong_args.items():
                     parameters.append({
                         'field': arg_name,
                         'type': str(strong_arg.type).strip('<>'),
@@ -364,6 +364,6 @@ def TEST(expr):
     ok = eval('A %s B' % op)
     tips = '\033[32m[OK]\033[0m' if ok else '\033[31m[FAIL]\033[0m'
     print('- %s -> %s'%(expr, tips))
-    return ok, A, op, B
+    return ok
 
 
