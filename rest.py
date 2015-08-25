@@ -7,9 +7,6 @@ import inspect
 import functools
 import collections
 
-class NOT_SET(object):
-    pass
-
 class PolyMethod(object):
     def __init__(self, name):
         self._name = name
@@ -32,25 +29,28 @@ def as_method(method):
     def decorator(f):
         spec = inspect.getargspec(f)
         defaults = list(spec.defaults) if spec.defaults else []
-        if defaults:
-            while defaults and getattr(defaults[0], 'default', None) == NOT_SET:
-                defaults.pop(0)
+        defaults = filter(lambda x: not getattr(x, 'required', False), defaults)
+
         f._method = method
         f._required_args = set(spec.args[1:len(spec.args)-len(defaults)])
         f._args = spec.args
         f._keywords = spec.keywords
         return f
+
     return decorator
 
 def as_class(f, method):
-    return type(f.func_name, (object,), {method.upper():staticmethod(f)})
+    return type(f.func_name, (object,), {method.upper(): staticmethod(f)})
 
-class BaseStrongArg(object):
+class StrongArg(object):
     type = object
+
+    class NOT_SET(object):
+        pass
 
     def __init__(self, default=NOT_SET, desc='-'):
         self.default = default
-        self.required = (default == NOT_SET)
+        self.required = (default == self.NOT_SET)
         self.desc = desc
 
     def validate(self, value):
@@ -58,11 +58,16 @@ class BaseStrongArg(object):
             return value
         return self.type(value)
 
-IntArg = type('IntArg', (BaseStrongArg,), dict(type=int))
-StrArg = type('StrArg', (BaseStrongArg,), dict(type=str))
-BoolArg = type('BoolArg', (BaseStrongArg,), dict(type=bool))
+class IntArg(StrongArg):
+    type = int
 
-class ListArg(BaseStrongArg):
+class StrArg(StrongArg):
+    type = str
+
+class BoolArg(StrongArg):
+    type = bool
+
+class ListArg(StrongArg):
     type = list
 
     def validate(self, value):
@@ -72,21 +77,13 @@ class ListArg(BaseStrongArg):
 
 class IntListArg(ListArg):
     def validate(self, value):
-        if not isinstance(value, list):
-            raise ValueError('Expect int list')
-        for i in value:
-            if not isinstance(i, (int, long)):
-                raise ValueError('Expect int list')
-        return value
+        value = value if isinstance(value, list) else list(value)
+        return map(lambda x: x if isinstance(x, int) else int(x), value)
 
 class StrListArg(ListArg):
     def validate(self, value):
-        if not isinstance(value, list):
-            raise ValueError('Expect string list')
-        for i in value:
-            if not isinstance(i, basestring):
-                raise ValueError('Expect string list')
-        return value
+        value = value if isinstance(value, list) else list(value)
+        return map(lambda x: x if isinstance(x, basestring) else str(x), value)
 
 def be_strong(f):
     try: spec = inspect.getargspec(f)
@@ -98,22 +95,22 @@ def be_strong(f):
     real_defaults = []
     required_count = len(spec.args) - len(spec.defaults)
     for i, d in enumerate(spec.defaults):
-        if isinstance(d, BaseStrongArg):
-            arg_name = spec.args[required_count+i]
+        if isinstance(d, StrongArg):
+            arg_name = spec.args[required_count + i]
             strong_args[arg_name] = d
-            if d.default != NOT_SET:
+            if not d.required:
                 real_defaults.append(d.default)
-            if real_defaults and d.default == NOT_SET:
+            if real_defaults and d.required:
                 raise SyntaxError('non-default argument follows default argument')
         else:
             real_defaults.append(d)
+
     if not strong_args:
         return f
+
     real_defaults = tuple(real_defaults)
-    if hasattr(f, '__func__'):
-        f.__func__.func_defaults = real_defaults
-    else:
-        f.func_defaults = real_defaults
+    func = getattr(f, '__func__', f)
+    func.func_defaults = func.__defaults__ = real_defaults
 
     f._strong_args = strong_args
     @functools.wraps(f)
@@ -124,6 +121,7 @@ def be_strong(f):
             if strong_arg:
                 kwargs[name] = strong_arg.validate(value)
         return f(**kwargs)
+
     for p in dir(f):
         if p[0] == '_' and p[1] != '_':
             setattr(wrapper, p, getattr(f, p))
@@ -142,7 +140,7 @@ class RestError(Exception):
 class RestResourceMeta(type):
     def __new__(cls, name, bases, attrs):
         for k, v in attrs.items():
-            if callable(v):
+            if inspect.isfunction(v):
                 attrs[k] = be_strong(v)
         return type.__new__(cls, name, bases, attrs)
 
@@ -165,7 +163,7 @@ class RestResource(object):
             validator = getattr(self, '_validate_'+name, None)
             if validator: params[name] = validator(params[name])
 
-def parse_wsgi_environ(environ):
+def _parse_wsgi_environ(environ):
     def _parse_json(s):
         try: return json.loads(s)
         except: return {}
@@ -189,7 +187,7 @@ class RestApp(object):
         self.mapping = dict(mapping)
 
     def extract_wsgi_environ(self, environ):
-        req = parse_wsgi_environ(environ)
+        req = _parse_wsgi_environ(environ)
         return req['method'], req['path'], req['params'], req['headers']
 
     def wsgi(self, environ, start_response):
@@ -222,14 +220,17 @@ class RestApp(object):
         endpoint, method_override, extra_params = None, None, {}
         parts = [part.strip().lower() for part in path.split('/')]
         parts = filter(lambda x: len(x) > 0, parts)
-        if not parts: return None, None, {}
+        if not parts:
+            return None, None, {}
 
         if parts[-1].startswith('_'):
             method_override = parts.pop()[1:]
         if len(parts) % 2 == 0:
             extra_params['id'] = self.to_id(parts.pop())
         endpoint = parts.pop()
-        extra_params.update({parts[i*2]+'_id': self.to_id(parts[i*2+1]) for i in range(len(parts)/2)})
+        extra_params.update(
+            {parts[i*2]+'_id': self.to_id(parts[i*2+1]) for i in range(len(parts)/2)}
+        )
         if None in extra_params.values():
             return None, None, {}
 
@@ -289,7 +290,7 @@ class RestApp(object):
                 if 'id' in f._strong_args:
                     path.append(':id')
                 if method not in {'GET', 'POST', 'PUT', 'PATCH', 'DELETE'}:
-                    path.append('_'+method.lower())
+                    path.append('_' + method.lower())
                     method = 'POST'
                 api = {
                     'group': endpoint,
@@ -305,107 +306,64 @@ class RestApp(object):
         return {'api': apis}
 
 class RestClient(object):
-    def __init__(self, base_url, headers={}, pool_size=4, retries=0):
+    def __init__(self, base_url, headers={}):
         import requests
-        self.base_url = base_url
+        self.base_url = base_url.rstrip('/')
         self.headers = headers
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_maxsize=pool_size,
-            pool_connections=pool_size,
-            max_retries=retries
-        )
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        self.session = session
+        self.session = requests.Session() # no retry
 
-    def request(self, method, path, params):
-        url = self.base_url.rstrip('/') + '/' + path.strip('/') + '/'
-        if method not in {'GET', 'POST', 'PUT', 'PATCH', 'DELETE'}:
-            url = url.rstrip('/') + '/_' + method.lower() + '/'
-            method = 'POST'
+    def request(self, method, path, params=None):
+        url = self.base_url + '/' + path
+        params = params or {}
         if method != 'GET':
-            data = json.dumps(params)
-            params = {}
+            params, data = None, json.dumps(params)
         else:
-            data = None
+            params, data = params, None
+
         try:
-            resp = self.session.request(method, url, params=params, data=data, headers=self.headers)
-            resp = resp.json()
+            resp = self.session.request(
+                method=method,
+                url=url,
+                params=params,
+                data=data,
+                headers=self.headers
+            ).json()
         except:
-            return {}
+            resp = {}
         return resp
 
     def __getattr__(self, name):
-        def _method(path, params):
-            return self.request(name, path, params)
-        if name.isupper():
-            return _method
-        raise AttributeError
+        return lambda x, y=None: self.request(name, x, y)
 
-class RestTest(object):
-    def __init__(self, req, params, *commands):
-        self.method, self.path = req.split(' ')
-        self.params = params
-        self.commands = commands
+def _transform(s, vars):
+    builtin_vars = {
+        'true': True,
+        'false': False,
+        'none': None,
+    }
+    if s.lower() in builtin_vars:
+        return builtin_vars[s.lower()]
+    elif s.startswith('$'):
+        ss = s.split('.')
+        v = vars[ss[0][1:]]
+        for k in ss[1:]:
+            if k == 'length':
+                return len(v)
+            k = int(k) if k[1:].isdigit() else k
+            v = v.__getitem__(k)
+        return v
+    elif s.isdigit():
+        return int(s)
+    else:
+        return s
 
-    def __str__(self):
-        return self.method + ' ' + self.path
-
-class RestTestRunner(object):
-    def __init__(self, client, inject_params=None, show_detail=False):
-        self._client = client
-        self._inject_params = inject_params
-        self._show_detail = show_detail
-
-    def transform(self, s, vars):
-        if s.startswith('#'):
-            if s[1:].lower() in {'true', 'false', 'none'}:
-                return {'true': True, 'false': False, 'none':None}[s[1:].lower()]
-            elif s[1:].isdigit():
-                return int(s[1:])
-            else:
-                return s
-        elif s.startswith('$'):
-            ss = s.split('.')
-            v = vars[ss[0][1:]]
-            for k in ss[1:]:
-                if k == 'length':
-                    v = len(v)
-                    continue
-                k = int(k) if k[1:].isdigit() else k
-                v = v.__getitem__(k)
-            return v
-        else:
-            return s
-
-    def run(self, tests):
-        for test in tests:
-            assert isinstance(test, RestTest)
-            method = test.method
-            path = test.path
-            params = test.params
-
-            path = '/' + '/'.join([self.transform(s, locals()) for s in path.split('/')]) + '/'
-            params = {k: self.transform(v, locals()) for k, v in params.items()}
-            if self._inject_params:
-                params.update(self._inject_params)
-
-            print('=' * 100)
-            print(test)
-            resp = self._client.request(method, path, params)
-
-            for command in test.commands:
-                A, op, B = command.split(' ')
-                A, B = self.transform(A, locals()), self.transform(B, locals())
-                ok = eval('A ' + op + ' B')
-                tips = '\033[32m[OK]\033[0m' if ok else '\033[31m[FAIL]\033[0m'
-                print('- %s -> %s'%(command, tips))
-                if not ok and self._show_detail:
-                    print(resp)
-
-        print('=' * 100)
-
-
+def TEST(expr):
+    caller_frame = inspect.stack()[1][0]
+    vars = caller_frame.f_locals
+    A, op, B = map(lambda x: _transform(x, vars), expr.split(' '))
+    ok = eval('A %s B' % op)
+    tips = '\033[32m[OK]\033[0m' if ok else '\033[31m[FAIL]\033[0m'
+    print('- %s -> %s'%(expr, tips))
+    return ok, A, op, B
 
 
