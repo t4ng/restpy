@@ -11,6 +11,45 @@ import functools
 import collections
 
 
+class DictObject(dict):
+
+    def __getattr__(self, name):
+        return self[name]
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+def _get_arg_info(fn):
+    spec = inspect.getargspec(fn)
+    info = DictObject()
+
+    info.defaults = list(spec.defaults or [])
+    info.args = spec.args
+    info.varargs = spec.varargs
+    info.keywords = spec.keywords
+
+    required_count = len(info.args) - len(info.defaults)
+    info.required_args = set(info.args[1:required_count])
+
+    if 'self' in info.required_args:
+        info.remove('self')
+
+    info.default_dict = collections.OrderedDict(
+        [(info.args[i + required_count], d)
+         for i, d in enumerate(info.defaults)]
+    )
+
+    return info
+
+
+def _arg_check(arg_info, input_args):
+    if arg_info.required_args.issubset(input_args) and \
+            (input_args.issubset(arg_info.args) or arg_info.keywords):
+        return True
+    return False
+
+
 class StrongArg(object):
     type = object
 
@@ -68,119 +107,64 @@ class StrListArg(ListArg):
         return map(lambda x: x if isinstance(x, basestring) else str(x), value)
 
 
-def be_strong(f):
-    spec = inspect.getargspec(f)
-    if not spec or not spec.defaults:
-        return f
+class StrongTypeError(TypeError):
+    pass
 
-    required_count = len(spec.args) - len(spec.defaults)
+
+def be_strong(fn):
+    arg_info = _get_arg_info(fn)
+    if not arg_info or not arg_info.defaults:
+        return fn
+
     strong_args = collections.OrderedDict()
     real_defaults = []
-
-    for i, d in enumerate(spec.defaults):
-        if not isinstance(d, StrongArg):
-            real_defaults.append(d)
+    for name, value in arg_info.default_dict.items():
+        if not isinstance(value, StrongArg):
+            real_defaults.append(value)
             continue
 
-        arg_name = spec.args[required_count + i]
-        strong_args[arg_name] = d
+        strong_args[name] = value
+        if not value.required:
+            real_defaults.append(value.default)
 
-        if not d.required:
-            real_defaults.append(d.default)
-
-        if real_defaults and d.required:
+        if real_defaults and value.required:
             raise SyntaxError(
                 'non-default argument follows default argument')
 
     if not strong_args:
-        return f
+        return fn
 
-    real_defaults = tuple(real_defaults)
-    func = getattr(f, '__func__', f)
-    func.func_defaults = func.__defaults__ = real_defaults
+    fn.func_defaults = tuple(real_defaults)
+    fn._strong_args = strong_args
 
-    f._strong_args = strong_args
-
-    @functools.wraps(f)
-    def wrapper(*args, **kwargs):
-        kwargs.update(dict(zip(spec.args, args)))
+    @functools.wraps(fn)
+    def inner(*args, **kwargs):
+        kwargs.update(dict(zip(arg_info.args, args)))
 
         for name, value in list(kwargs.items()):
-            strong_arg = f._strong_args.get(name)
-            if strong_arg:
-                kwargs[name] = strong_arg.validate(value)  # TODO Try:TypeError
+            strong_arg = fn._strong_args.get(name)
+            if not strong_arg:
+                continue
+            try:
+                kwargs[name] = strong_arg.validate(value)
+            except:
+                raise StrongTypeError('%s type error' % name)
 
-        return f(**kwargs)
+        return fn(**kwargs)
 
-    wrapper._func = f
-    return wrapper
+    inner._fn = fn
+    return inner
 
 
 def as_method(method):
-    def decorator(f):
-        f._method = method
-        return f
+    def decorator(fn):
+        fn._method = method
+        return fn
     return decorator
 
 
-def as_class(f, method):
-    return type(f.func_name, (object,), {method.upper(): staticmethod(f)})
-
-
-class RestError(Exception):
-    type = 'BASE_ERROR'
-    message = 'Base Rest Error Message'
-
-    def __init__(self, detail=None):
-        self.detail = detail
-
-    def to_dict(self):
-        return dict(type=self.type, message=self.message, detail=self.detail)
-
-
-class RestResourceMeta(type):
-
-    def __new__(cls, name, bases, attrs):
-        poly_methods = {}
-        for k, v in attrs.items():
-            if inspect.isfunction(v):
-                v = be_strong(v)
-                attrs[k] = v
-                if hasattr(v, '_method'):
-                    fs = poly_methods.get(v._method, [])
-                    fs.append(v)
-                    poly_methods[v._method] = fs
-
-        for method, fs in poly_methods.items():
-            if len(fs) == 1:
-                attrs[method] = fs[0]
-                continue
-
-            for f in fs:
-                spec = inspect.getargspec(getattr(f, '_func', f)) # f is wrapper in be_strong
-                defaults = list(spec.defaults) if spec.defaults else []
-
-                f._required_args = set(
-                    spec.args[1:len(spec.args) - len(defaults)])
-                f._args = spec.args
-                f._keywords = spec.keywords
-
-            fs.sort(key=lambda x: len(x._required_args), reverse=True)
-
-            def poly(self, *args, **kwargs):
-                cargs = set(kwargs.keys())
-                for f in fs:
-                    if f._required_args.issubset(cargs) and \
-                            (cargs.issubset(f._args) or f._keywords):
-                        return f(self, *args, **kwargs)
-                raise TypeError('%s got unexcept keyword argument %s' %
-                                (self._name, ','.join(args)))
-
-            poly._fs = fs
-            attrs[method] = poly
-
-        attrs['_poly_methods'] = poly_methods
-        return type.__new__(cls, name, bases, attrs)
+def as_class(fn, method):
+    return type(fn.func_name, (object,), {method.upper(): staticmethod(fn)})
 
 
 def _json_loads(s):
@@ -199,6 +183,57 @@ def _json_dumps_default(obj):
         return obj.__dict__
 
 
+class RestError(Exception):
+    type = 'BASE_ERROR'
+    message = 'Base Rest Error Message'
+
+    def __init__(self, detail=None):
+        self.detail = detail
+
+    def to_dict(self):
+        return dict(type=self.type, message=self.message, detail=self.detail)
+
+
+class DefaultError(RestError):
+    type = 'DEFAULT_ERROR'
+    message = 'Default API Error'
+
+
+class RestResourceMeta(type):
+
+    def __new__(cls, name, bases, attrs):
+        poly_methods = {}
+        for k, v in attrs.items():
+            if inspect.isfunction(v):
+                v = be_strong(v)
+                v._arg_info = _get_arg_info(getattr(v, '_fn', v))  # be_strong
+                attrs[k] = v
+
+                if hasattr(v, '_method'):
+                    fs = poly_methods.get(v._method, [])
+                    fs.append(v)
+                    poly_methods[v._method] = fs
+
+        for method, fs in poly_methods.items():
+            if len(fs) == 1:
+                attrs[method] = fs[0]
+                continue
+
+            fs.sort(key=lambda x: len(x._arg_info.required_args), reverse=True)
+
+            def poly(self, **kwargs):
+                input_args = set(kwargs.keys())
+                for f in fs:
+                    if _arg_check(f._arg_info, input_args):
+                        return f(self, **kwargs)
+                return None  # None means API not found
+
+            poly._fs = fs
+            attrs[method] = poly
+
+        return type.__new__(cls, name, bases, attrs)
+
+
 class RestResource(object):
     __metaclass__ = RestResourceMeta
 
@@ -207,20 +242,20 @@ class RestResource(object):
         self.extra_result = {}
 
 
-class RestContext(dict):
-
-    def __getattr__(self, name):
-        return self[name]
-
-    def __setattr__(self, name, value):
-        self[name] = value
-
-
 class RestApp(object):
 
-    def __init__(self, mappings=None, default_context=None):
-        self._mappings = dict(mappings) if mappings else {}
+    def __init__(self,
+                 mappings=None,
+                 default_context=None,
+                 ignore_more_params=True,
+                 params_error_cls=DefaultError,
+                 noapi_error_cls=DefaultError):
+
+        self._mappings = dict(mappings or {})
         self._default_context = default_context or {}
+        self._ignore_more_params = ignore_more_params
+        self._params_error_cls = params_error_cls
+        self._noapi_error_cls = noapi_error_cls
 
     def parse_wsgi_environ(self, environ):
 
@@ -233,7 +268,7 @@ class RestApp(object):
         body = environ['wsgi.input'].read()
         query_str = environ['QUERY_STRING']
         headers = {k[5:]: v
-                   for k, v in environ.items() 
+                   for k, v in environ.items()
                    if k.startswith('HTTP_')}
 
         params = _json_loads(body)
@@ -245,7 +280,7 @@ class RestApp(object):
     def headers_to_context(self, headers):
         ctx_header = headers.get('X-Rest-Context', '')
         ctx_header = base64.b64decode(ctx_header)
-        ctx = RestContext(self._default_context)
+        ctx = DictObject(self._default_context)
         ctx.update(_json_loads(ctx_header))
         return ctx
 
@@ -254,7 +289,7 @@ class RestApp(object):
         context = self.headers_to_context(headers)
         resp = self.request(method, path, params, context)
         start_response('200 OK', [('Content-Type', 'application/json')])
-        return [json.dumps(resp, default=_json_dumps_default, indent=2)]
+        return [json.dumps(resp, default=_json_dumps_default)]
 
     def run(self, host='0.0.0.0', port=8080):
         from tornado import wsgi, httpserver, ioloop
@@ -315,24 +350,43 @@ class RestApp(object):
         endpoint, method_override, extra_params = self.extract_path(path)
         rclass = self._mappings.get(endpoint)
         if not rclass:
-            return {}
+            return self.make_response(
+                error=self._noapi_error_cls('No Such API Endpoint')
+            )
 
-        resource = rclass(context) if issubclass(
-            rclass, RestResource) else rclass()
+        rc = rclass(context) if issubclass(rclass, RestResource) else rclass()
         method = method_override or method
         params.update(extra_params)
 
-        to_call = getattr(resource, method.upper(), None)
+        to_call = getattr(rc, method.upper(), None)
         if not callable(to_call):
-            return {}
+            return self.make_response(
+                error=self._noapi_error_cls('No Such API Call')
+            )
+
+        arg_info = getattr(to_call, '_arg_info', _get_arg_info(to_call))
+        input_args = set(params.keys())
+        if not _arg_check(arg_info, input_args):
+            if self._ignore_more_params:
+                for arg in input_args - set(arg_info.args):
+                    params.pop(arg)
+            else:
+                return self.make_response(error=self._params_error_cls(
+                    'ErrorArgs: %s' % ','.join(input_args)
+                ))
 
         result, error = None, None
         try:
-            result = to_call(**params)  # TODO
+            result = to_call(**params)
+        except StrongTypeError as ex:
+            error = self._params_error_cls(ex.message)
         except RestError as ex:
             error = ex
 
-        extra_result = getattr(resource, 'extra_result', None)
+        if result is None and error is None:
+            error = self._noapi_error_cls('No Such API Result')
+
+        extra_result = getattr(rc, 'extra_result', None)
         response = self.make_response(result, extra_result, error)
         return response
 
@@ -344,7 +398,7 @@ class RestClient(object):
         self._base_url = base_url.rstrip('/')
         self._headers = headers or {}
         self._inject_params = inject_params or {}
-        self._session = requests.Session()  # no retry
+        self._session = requests.Session()
 
     def request(self, method, path, params=None):
         url = self._base_url + '/' + path.lstrip('/')
