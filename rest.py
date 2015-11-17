@@ -196,7 +196,7 @@ class RestError(Exception):
 
 class DefaultError(RestError):
     type = 'DEFAULT_ERROR'
-    message = 'Default API Error'
+    message = 'API Error'
 
 
 class RestResourceMeta(type):
@@ -247,15 +247,15 @@ class RestApp(object):
     def __init__(self,
                  mappings=None,
                  default_context=None,
-                 ignore_more_params=True,
-                 params_error_cls=DefaultError,
-                 noapi_error_cls=DefaultError):
+                 ignore_more_args=True,
+                 params_error=DefaultError,
+                 noapi_error=DefaultError):
 
         self._mappings = dict(mappings or {})
         self._default_context = default_context or {}
-        self._ignore_more_params = ignore_more_params
-        self._params_error_cls = params_error_cls
-        self._noapi_error_cls = noapi_error_cls
+        self._ignore_more_args = ignore_more_args
+        self._params_error = params_error
+        self._noapi_error = noapi_error
 
     def parse_wsgi_environ(self, environ):
 
@@ -351,7 +351,7 @@ class RestApp(object):
         rclass = self._mappings.get(endpoint)
         if not rclass:
             return self.make_response(
-                error=self._noapi_error_cls('No Such API Endpoint')
+                error=self._noapi_error('No Such API Endpoint')
             )
 
         rc = rclass(context) if issubclass(rclass, RestResource) else rclass()
@@ -361,30 +361,31 @@ class RestApp(object):
         to_call = getattr(rc, method.upper(), None)
         if not callable(to_call):
             return self.make_response(
-                error=self._noapi_error_cls('No Such API Call')
+                error=self._noapi_error('No Such API Call')
             )
 
         arg_info = getattr(to_call, '_arg_info', _get_arg_info(to_call))
         input_args = set(params.keys())
         if not _arg_check(arg_info, input_args):
-            if self._ignore_more_params:
-                for arg in input_args - set(arg_info.args):
+            more_args = input_args - set(arg_info.args)
+            if self._ignore_more_args:
+                for arg in more_args:
                     params.pop(arg)
             else:
-                return self.make_response(error=self._params_error_cls(
-                    'ErrorArgs: %s' % ','.join(input_args)
+                return self.make_response(error=self._params_error(
+                    'ErrorArgs: %s' % ','.join(more_args)
                 ))
 
         result, error = None, None
         try:
             result = to_call(**params)
         except StrongTypeError as ex:
-            error = self._params_error_cls(ex.message)
+            error = self._params_error(ex.message)
         except RestError as ex:
             error = ex
 
         if result is None and error is None:
-            error = self._noapi_error_cls('No Such API Result')
+            error = self._noapi_error('No Such API Result')
 
         extra_result = getattr(rc, 'extra_result', None)
         response = self.make_response(result, extra_result, error)
