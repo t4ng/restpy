@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-# encoding: utf-8
+# encoding: utf8
 # Micro Restful API Framework
 
+import sys
 import time
 import datetime
 import json
@@ -9,6 +10,18 @@ import base64
 import inspect
 import functools
 import collections
+
+
+IS_PY3 = (sys.version_info >= (3, 0, 0))
+
+
+if IS_PY3:
+    callable = lambda x: hasattr(x, '__call__')
+    basestring = str
+
+
+def with_metaclass(meta, *bases):
+    return meta("NewBase", bases, {})
 
 
 class DictObject(dict):
@@ -234,9 +247,7 @@ class RestResourceMeta(type):
         return type.__new__(cls, name, bases, attrs)
 
 
-class RestResource(object):
-    __metaclass__ = RestResourceMeta
-
+class RestResource(with_metaclass(RestResourceMeta)):
     def __init__(self, context=None):
         self.context = context
         self.extra_result = {}
@@ -289,7 +300,7 @@ class RestApp(object):
         context = self.headers_to_context(headers)
         resp = self.request(method, path, params, context)
         start_response('200 OK', [('Content-Type', 'application/json')])
-        return [json.dumps(resp, default=_json_dumps_default)]
+        return [json.dumps(resp, default=_json_dumps_default).encode('utf8')]
 
     def run(self, host='0.0.0.0', port=8080):
         from tornado import wsgi, httpserver, ioloop
@@ -324,7 +335,7 @@ class RestApp(object):
     def extract_path(self, path):
         endpoint, method_override, extra_params = None, None, {}
         parts = [part.strip().lower() for part in path.split('/')]
-        parts = filter(lambda x: len(x) > 0, parts)
+        parts = list(filter(lambda x: len(x) > 0, parts))
         if not parts:
             return None, None, {}
 
@@ -337,10 +348,10 @@ class RestApp(object):
         endpoint = parts.pop()
         extra_params.update(
             {parts[i * 2] + '_id': self.to_id(parts[i * 2 + 1])
-             for i in range(len(parts) / 2)}
+             for i in range(len(parts) // 2)}
         )
 
-        if None in extra_params.values():
+        if None in list(extra_params.values()):
             return None, None, {}
 
         return endpoint, method_override, extra_params
