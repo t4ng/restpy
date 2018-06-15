@@ -3,21 +3,25 @@
 # Micro Restful API Framework
 
 import sys
+import re
 import time
 import datetime
 import json
-import base64
 import inspect
 import functools
 import collections
+import logging
+import traceback
 
 
 IS_PY3 = (sys.version_info >= (3, 0, 0))
-
-
 if IS_PY3:
-    callable = lambda x: hasattr(x, '__call__')
     basestring = str
+    long = int
+    bytes_to_str = lambda x: x.decode('utf8')
+else:
+    bytes = str
+    bytes_to_str = lambda x: x
 
 
 def with_metaclass(meta, *bases):
@@ -25,7 +29,6 @@ def with_metaclass(meta, *bases):
 
 
 class DictObject(dict):
-
     def __getattr__(self, name):
         return self[name]
 
@@ -33,7 +36,41 @@ class DictObject(dict):
         self[name] = value
 
 
+class CaseInsensitiveDict(DictObject):
+    def __getitem__(self, key):
+        return dict.__getitem__(self, str(key).title())
+
+    def __setitem__(self, key, value):
+        dict.__setitem__(self, str(key).title(), value)
+
+    def __delitem__(self, key):
+        dict.__delitem__(self, str(key).title())
+
+    def __contains__(self, key):
+        return dict.__contains__(self, str(key).title())
+
+    def get(self, key, default=None):
+        return dict.get(self, str(key).title(), default)
+
+    def update(self, E):
+        for k in E.keys():
+            self[str(k).title()] = E[k]
+
+    def pop(self, key, default):
+        return dict.pop(self, str(key).title(), default)
+
+
+def _get_real_fn(fn):
+    while True:
+        real_fn = getattr(fn, '_fn', None)
+        if not real_fn:
+            break
+        fn = real_fn
+    return fn
+
+
 def _get_arg_info(fn):
+    fn = _get_real_fn(fn)
     spec = inspect.getargspec(fn)
     info = DictObject()
 
@@ -120,12 +157,9 @@ class StrListArg(ListArg):
         return map(lambda x: x if isinstance(x, basestring) else str(x), value)
 
 
-class StrongTypeError(TypeError):
-    pass
-
-
 def be_strong(fn):
-    arg_info = _get_arg_info(fn)
+    real_fn = _get_real_fn(fn)
+    arg_info = _get_arg_info(real_fn)
     if not arg_info or not arg_info.defaults:
         return fn
 
@@ -147,8 +181,8 @@ def be_strong(fn):
     if not strong_args:
         return fn
 
-    fn.func_defaults = tuple(real_defaults)
-    fn._strong_args = strong_args
+    real_fn.__defaults__ = real_fn.func_defaults = tuple(real_defaults)
+    fn._strong_args = real_fn._strong_args = strong_args
 
     @functools.wraps(fn)
     def inner(*args, **kwargs):
@@ -160,8 +194,8 @@ def be_strong(fn):
                 continue
             try:
                 kwargs[name] = strong_arg.validate(value)
-            except:
-                raise StrongTypeError('%s type error' % name)
+            except Exception as ex:
+                raise StrongTypeError('%s(%s) type err: %s' % (name, value, ex))
 
         return fn(**kwargs)
 
@@ -182,8 +216,11 @@ def as_class(fn, method):
 
 def _json_loads(s):
     try:
-        return json.loads(s)
-    except:
+        if isinstance(s, bytes):
+            s = bytes_to_str(s).strip()
+        return json.loads(s) if s else {}
+    except Exception as ex:
+        logging.error('json loads error: %s', ex)
         return {}
 
 
@@ -192,8 +229,12 @@ def _json_dumps_default(obj):
         return int(time.mktime(obj.timetuple()))
     elif isinstance(obj, datetime.date):
         return obj.strftime('%Y-%m-%d')
-    else:
+    elif hasattr(obj, '_data'):
+        return dict(obj._data)
+    elif hasattr(obj, '__dict__'):
         return obj.__dict__
+    else:
+        return str(obj)
 
 
 class RestError(Exception):
@@ -212,6 +253,11 @@ class DefaultError(RestError):
     message = 'API Error'
 
 
+class StrongTypeError(RestError):
+    type = 'STRONG_TYPE_ERROR'
+    message = 'Strong Type Error'
+
+
 class RestResourceMeta(type):
 
     def __new__(cls, name, bases, attrs):
@@ -219,7 +265,7 @@ class RestResourceMeta(type):
         for k, v in attrs.items():
             if inspect.isfunction(v):
                 v = be_strong(v)
-                v._arg_info = _get_arg_info(getattr(v, '_fn', v))  # be_strong
+                v._arg_info = _get_arg_info(v) # be_strong
                 attrs[k] = v
 
                 if hasattr(v, '_method'):
@@ -234,9 +280,10 @@ class RestResourceMeta(type):
 
             fs.sort(key=lambda x: len(x._arg_info.required_args), reverse=True)
 
-            def poly(self, **kwargs):
+            # fuck Python closure using loop variant 
+            def poly(self, _fs=fs, **kwargs):
                 input_args = set(kwargs.keys())
-                for f in fs:
+                for f in _fs:
                     if _arg_check(f._arg_info, input_args):
                         return f(self, **kwargs)
                 return None  # None means API not found
@@ -259,14 +306,28 @@ class RestApp(object):
                  mappings=None,
                  default_context=None,
                  ignore_more_args=True,
+                 debug=False,
+                 id_pattern='^\d+$',
+                 path_prefix=None,
                  params_error=DefaultError,
-                 noapi_error=DefaultError):
+                 noapi_error=DefaultError,
+                 default_error=DefaultError,
+                 ex_callback=None):
 
         self._mappings = dict(mappings or {})
         self._default_context = default_context or {}
         self._ignore_more_args = ignore_more_args
+        self._debug = debug
+
+        self._id_regexp = re.compile(id_pattern)
+        self._path_prefix = path_prefix and path_prefix.strip('/').lower()
+
         self._params_error = params_error
         self._noapi_error = noapi_error
+        self._default_error = default_error
+        self.ex_callback = ex_callback
+
+        self._debug = debug
 
     def parse_wsgi_environ(self, environ):
 
@@ -278,34 +339,51 @@ class RestApp(object):
         path = environ['PATH_INFO'].lower()
         body = environ['wsgi.input'].read()
         query_str = environ['QUERY_STRING']
-        headers = {k[5:]: v
-                   for k, v in environ.items()
-                   if k.startswith('HTTP_')}
+        headers = CaseInsensitiveDict()
+        headers.update(
+            {k[5:].replace('_', '-'): v
+             for k, v in environ.items()
+             if k.startswith('HTTP_')}
+        )
 
         params = _json_loads(body)
-        params.update(dict([kv.split('=')
-                            for kv in query_str.split('&')
-                            if kv.count('=') == 1]))
+        params.update(_parse_qs(query_str))
         return method, path, params, headers
 
-    def headers_to_context(self, headers):
-        ctx_header = headers.get('X-Rest-Context', '')
-        ctx_header = base64.b64decode(ctx_header)
+    def make_context(self, params, headers):
         ctx = DictObject(self._default_context)
-        ctx.update(_json_loads(ctx_header))
+        ctx.update(dict(headers))
         return ctx
+
+    def set_resp_headers(self, context):
+        return []
 
     def wsgi(self, environ, start_response):
         method, path, params, headers = self.parse_wsgi_environ(environ)
-        context = self.headers_to_context(headers)
+        context = self.make_context(params, headers)
         resp = self.request(method, path, params, context)
-        start_response('200 OK', [('Content-Type', 'application/json')])
+        if self._debug:
+            resp['context'] = dict(context)
+            resp['headers'] = dict(headers)
+        resp_headers = [('Content-Type', 'application/json')]
+        resp_headers += self.set_resp_headers(context)
+        status_line = '200 OK' if not resp['error'] else '400 Bad Request'
+        start_response(status_line, resp_headers)
         return [json.dumps(resp, default=_json_dumps_default).encode('utf8')]
 
-    def run(self, host='0.0.0.0', port=8080):
+    def __call__(self, environ, start_response):
+        return self.wsgi(environ, start_response)
+
+    def run(self, host='0.0.0.0', port=8080, debug=None):
+        self._debug = debug if debug is not None else self._debug
         from tornado import wsgi, httpserver, ioloop
         httpserver.HTTPServer(wsgi.WSGIContainer(self.wsgi)).listen(port, host)
-        ioloop.IOLoop.instance().start()
+        ioloop_ins = ioloop.IOLoop.instance()
+        if self._debug:
+            from tornado import autoreload, log
+            log.enable_pretty_logging()
+            autoreload.start(ioloop_ins)
+        ioloop_ins.start()
 
     def map(self, endpoint, rclass):
         self._mappings[endpoint] = rclass
@@ -322,7 +400,10 @@ class RestApp(object):
         return decorator
 
     def to_id(self, s):
-        return int(s) if s.isdigit() else None
+        if self._id_regexp.match(s):
+            return s
+        else:
+            return None
 
     def make_response(self, result=None, extra_result=None, error=None):
         return {
@@ -337,6 +418,9 @@ class RestApp(object):
         parts = [part.strip().lower() for part in path.split('/')]
         parts = list(filter(lambda x: len(x) > 0, parts))
         if not parts:
+            return None, None, {}
+
+        if self._path_prefix and parts[0].lower() != self._path_prefix:
             return None, None, {}
 
         if parts[-1].startswith('_'):
@@ -362,7 +446,7 @@ class RestApp(object):
         rclass = self._mappings.get(endpoint)
         if not rclass:
             return self.make_response(
-                error=self._noapi_error('No Such API Endpoint')
+                error=self._noapi_error('No Such API Endpoint'),
             )
 
         rc = rclass(context) if issubclass(rclass, RestResource) else rclass()
@@ -391,9 +475,21 @@ class RestApp(object):
         try:
             result = to_call(**params)
         except StrongTypeError as ex:
-            error = self._params_error(ex.message)
+            error = self._params_error(ex.detail)
         except RestError as ex:
             error = ex
+        except Exception as ex:
+            if isinstance(ex, TypeError) and \
+                'required positional argument' in str(ex):
+                error = self._params_error(str(ex))
+            else:
+                ex_detail = traceback.format_exc()
+                ex_detail_list = ex_detail.split('\n')
+                logging.error(ex_detail_list)
+                error_detail = dict(ex=repr(ex), detail=ex_detail) if self._debug else repr(ex)
+                error = self._default_error(error_detail)
+                if self.ex_callback and callable(self.ex_callback):
+                    self.ex_callback(ex_detail)
 
         if result is None and error is None:
             error = self._noapi_error('No Such API Result')
