@@ -65,39 +65,11 @@ class UserResource(rest.RestResource):
         return {'is_follow': True}
 ```
 
-## Embed Restpy in Django/Flask
-The RestApp's entry is defined like this:
+## Deployment
+Use uvicorn and asgi
 
 ```python
-class RestApp(object):
-    def request(self, method, path, params, context=None):
-        ...
-```
-
-you can call it directly, it will return a dict response:
-
-```python
-app.request('GET', '/user/123/blog/', {'title':'haha'})
-# Response:
-{
-    'success': True,
-    'error': None,
-    'result': {'id': 111},
-}
-```
-
-So its very easy to embed it anywhere, you just need add a wildcard route in MVC framework, and parse method&path&params from MVC request. For example:
-
-```python
-# route: url(r'^api/(?P<path>.+)$', 'django_view'),
-def django_view(request, path):
-    method = request.method
-    if method == 'GET':
-        params = dict(request.GET.items())
-    else:
-        params = json.loads(request.raw_post_data)
-    json_response = app.request(method, path, params)
-    return json.dumps(json_response)
+uvicorn.run('app:app', host=host, port=port, reload=settings.DEBUG, interface='asgi3')
 ```
 
 ## Use context
