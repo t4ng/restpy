@@ -174,10 +174,13 @@ class MyRestApp(rest.RestApp):
 ```
 
 ### Params Validate
-define **_validate_x** function for param x
+define **XxxArg** function instead of args to validate args type
 ```python
 class BlogResource(rest.Resource):
-    _validate_id = int
-    def _validate_count(self, count):
-        return int(count)
+    def GET(self, count=rest.IntArg(0)):  # count must be int, default value is 0
+        return {'count': count}
+
+    def POST(self, name=rest.StrArg()):
+        return {'name': name}
 ```
+You can also define you custom XxxArg class by in inherit from StrongArg class
