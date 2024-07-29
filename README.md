@@ -71,37 +71,6 @@ Use uvicorn and asgi
 ```python
 uvicorn.run('app:app', host=host, port=port, reload=settings.DEBUG, interface='asgi3')
 ```
-
-## Use context
-Sometimes, we need some context besides method/path/params, such as cookies/session and so on. In Restpy, you can deside what kind of context to use.
-If you are using RestApp as a single WSGI Application, you need inherit RestApp and override **extract_wsgi_environ** method:
-
-```python
-# original extract_wsgi_environ, last return value is context
-def extract_wsgi_environ(self, environ):
-    req = parse_wsgi_environ(environ)
-    return req['method'], req['path'], req['params'], req['headers']
-    
-# custom context 
-def extract_wsgi_environ(self, environ):
-    req = parse_wsgi_environ(environ)
-    return req['method'], req['path'], req['params'], {'hello':'bitch'}
-```
-
-If you are using RestApp in other MVC Framework, just pass context when you call **app.request**
-
-```python
-app.request(method, path, params, context={'hello':'bitch'})
-```
-
-Use context in resource class method:
-
-```python
-class BlogResource(rest.RestResource):
-    def GET(self, id):
-        ctx = self.context
-        return {'id': id, 'current_user_id': ctx.user_id}
-```
     
 ## Other features
 ### API Errors
