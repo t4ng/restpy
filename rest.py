@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # encoding: utf8
 # Micro Restful API Framework
+# Author: t4ng
 
 import sys
 import re
@@ -12,16 +13,14 @@ import functools
 import collections
 import logging
 import traceback
+import asyncio
+from urllib.parse import parse_qs
 
 
-IS_PY3 = (sys.version_info >= (3, 0, 0))
-if IS_PY3:
-    basestring = str
-    long = int
-    bytes_to_str = lambda x: x.decode('utf8')
-else:
-    bytes = str
-    bytes_to_str = lambda x: x
+NUM_ID_PATTERN = r'^\d+$'
+OBJECT_ID_PATTERN = r'^[0-9a-f]{24}$'
+
+bytes_to_str = lambda x: x.decode('utf8')
 
 
 def with_metaclass(meta, *bases):
@@ -119,7 +118,7 @@ class IntArg(StrongArg):
     type = int
 
     def validate(self, value):
-        return value if isinstance(value, (int, long)) else int(value)
+        return value if isinstance(value, int) else int(value)
 
 
 class FloatArg(StrongArg):
@@ -144,17 +143,15 @@ class ListArg(StrongArg):
 
 
 class IntListArg(ListArg):
-
     def validate(self, value):
         value = value if isinstance(value, list) else list(value)
-        return map(lambda x: x if isinstance(x, (int, long)) else int(x), value)
+        return map(lambda x: x if isinstance(x, int) else int(x), value)
 
 
 class StrListArg(ListArg):
-
     def validate(self, value):
         value = value if isinstance(value, list) else list(value)
-        return map(lambda x: x if isinstance(x, basestring) else str(x), value)
+        return map(lambda x: x if isinstance(x, str) else str(x), value)
 
 
 def be_strong(fn):
@@ -211,7 +208,7 @@ def as_method(method):
 
 
 def as_class(fn, method):
-    return type(fn.func_name, (object,), {method.upper(): staticmethod(fn)})
+    return type(fn.__name__, (object,), {method.upper(): staticmethod(fn)})
 
 
 def _json_loads(s):
@@ -221,7 +218,7 @@ def _json_loads(s):
         return json.loads(s) if s else {}
     except Exception as ex:
         logging.error('json loads error: %s', ex)
-        return {}
+        return None
 
 
 def _json_dumps_default(obj):
@@ -235,6 +232,10 @@ def _json_dumps_default(obj):
         return obj.__dict__
     else:
         return str(obj)
+
+
+def _json_dumps(obj):
+    return json.dumps(obj, default=_json_dumps_default)
 
 
 class RestError(Exception):
@@ -259,13 +260,12 @@ class StrongTypeError(RestError):
 
 
 class RestResourceMeta(type):
-
     def __new__(cls, name, bases, attrs):
         poly_methods = {}
         for k, v in attrs.items():
             if inspect.isfunction(v):
                 v = be_strong(v)
-                v._arg_info = _get_arg_info(v) # be_strong
+                v._arg_info = _get_arg_info(v)  # be_strong
                 attrs[k] = v
 
                 if hasattr(v, '_method'):
@@ -280,7 +280,7 @@ class RestResourceMeta(type):
 
             fs.sort(key=lambda x: len(x._arg_info.required_args), reverse=True)
 
-            # fuck Python closure using loop variant 
+            # fuck Python closure using loop variant
             def poly(self, _fs=fs, **kwargs):
                 input_args = set(kwargs.keys())
                 for f in _fs:
@@ -301,13 +301,12 @@ class RestResource(with_metaclass(RestResourceMeta)):
 
 
 class RestApp(object):
-
     def __init__(self,
                  mappings=None,
                  default_context=None,
                  ignore_more_args=True,
                  debug=False,
-                 id_pattern='^\d+$',
+                 id_pattern=NUM_ID_PATTERN,
                  path_prefix=None,
                  params_error=DefaultError,
                  noapi_error=DefaultError,
@@ -327,63 +326,136 @@ class RestApp(object):
         self._default_error = default_error
         self.ex_callback = ex_callback
 
-        self._debug = debug
+    @classmethod
+    def parse_qs(cls, s):
+        return {k: v[0] for k, v in parse_qs(s).items()}
 
-    def parse_wsgi_environ(self, environ):
-
-        def _parse_qs(s):
-            kvs = [kv for kv in s.split('&') if kv.count('=') == 1]
-            return dict([kv.split('=') for kv in kvs])
-
-        method = environ['REQUEST_METHOD'].upper()
-        path = environ['PATH_INFO'].lower()
-        body = environ['wsgi.input'].read()
-        query_str = environ['QUERY_STRING']
+    @classmethod
+    async def parse_asgi_scope(cls, scope, receive):
+        method = scope['method']
+        path = scope['path']
         headers = CaseInsensitiveDict()
-        headers.update(
-            {k[5:].replace('_', '-'): v
-             for k, v in environ.items()
-             if k.startswith('HTTP_')}
-        )
+        for name, value in scope['headers']:
+            headers[name.decode('utf8')] = value.decode('utf8')
+        method = headers.get('X-Method', method)
+        
+        body = b''
+        more_body = True
+        while more_body:
+            msg = await receive()
+            body += msg.get('body', b'')
+            more_body = msg.get('more_body', False)
 
         params = _json_loads(body)
-        params.update(_parse_qs(query_str))
+        if params is None:
+            params = {'_raw_body': body} if body else {}
+
+        query_str = bytes_to_str(scope.get('query_string', b''))
+        params.update(cls.parse_qs(query_str))
         return method, path, params, headers
+
+    async def asgi(self, scope, receive, send):
+        if scope['type'] != 'http':
+            return 
+
+        method, path, params, headers = await self.parse_asgi_scope(scope, receive)
+        context = self.make_context(params, headers)
+        resp = await self.request(method, path, params, context)
+        is_async_gen = inspect.isasyncgen(resp)
+        is_stream = is_async_gen or inspect.isgenerator(resp)
+        if is_stream:
+            resp_headers = [
+                (b'Content-Type', b'text/event-stream'),
+                (b'Cache-Control', b'no-cache'),
+                (b'Connection', b'keep-alive'),
+            ]
+            resp_headers += self.set_resp_headers(context) # need bytes headers
+            await send({
+                'type': 'http.response.start',
+                'status': 200,
+                'headers': resp_headers,
+            })
+            
+            # fuck so many indent
+            try: 
+                if is_async_gen:
+                    async for r in resp:
+                        if not isinstance(r, str):
+                            r = 'data:%s\n\n' % _json_dumps(r)
+                        await send({
+                            'type': 'http.response.body',
+                            'body': r.encode('utf8'),
+                            'more_body': True
+                        })
+                else:
+                    for r in resp:
+                        if not isinstance(r, str):
+                            r = 'data:%s\n\n' % _json_dumps(r)
+                        await send({
+                            'type': 'http.response.body',
+                            'body': r.encode('utf8'),
+                            'more_body': True
+                        })
+            except Exception as ex:
+                logging.error(traceback.format_exc())
+                if not isinstance(ex, RestError):
+                    ex = self._default_error(str(ex))
+                body = 'event:error\ndata:%s\n\n' % _json_dumps(ex.to_dict())
+                await send({
+                    'type': 'http.response.body',
+                    'body': body.encode('utf8'),
+                    'more_body': True
+                })
+
+            await send({
+                'type': 'http.response.body',
+                'body': b'event:end\ndata:\n\n',
+                'more_body': False
+            })
+
+        elif isinstance(resp, dict):
+            resp_headers = [
+                (b'Content-Type', b'application/json'),
+                (b'Cache-Control', b'no-cache'),
+            ]
+            resp_headers += self.set_resp_headers(context) # need bytes headers
+            await send({
+                'type': 'http.response.start',
+                'status': 200,
+                'headers': resp_headers,
+            })
+            result = json.dumps(resp, default=_json_dumps_default).encode('utf8')
+            await send({'type': 'http.response.body', 'body': result})
+
+        else:
+            if not isinstance(resp, bytes):
+                resp = str(resp).encode('utf8')
+
+            await send({
+                'type': 'http.response.start',
+                'status': 200,
+            })
+            await send({'type': 'http.response.body', 'body': resp})
 
     def make_context(self, params, headers):
         ctx = DictObject(self._default_context)
-        ctx.update(dict(headers))
+        ctx.headers = headers.copy()
+        ctx.host = headers.get('Host', '')
+        ctx.user_agent = headers.get('User-Agent')
+        ctx.referer = headers.get('Referer')
+        ctx.cookies = headers.get('Cookie', '')
         return ctx
 
     def set_resp_headers(self, context):
         return []
 
-    def wsgi(self, environ, start_response):
-        method, path, params, headers = self.parse_wsgi_environ(environ)
-        context = self.make_context(params, headers)
-        resp = self.request(method, path, params, context)
-        if self._debug:
-            resp['context'] = dict(context)
-            resp['headers'] = dict(headers)
-        resp_headers = [('Content-Type', 'application/json')]
-        resp_headers += self.set_resp_headers(context)
-        status_line = '200 OK' if not resp['error'] else '400 Bad Request'
-        start_response(status_line, resp_headers)
-        return [json.dumps(resp, default=_json_dumps_default).encode('utf8')]
+    async def __call__(self, scope, send, receive):
+        return await self.asgi(scope, send, receive)
 
-    def __call__(self, environ, start_response):
-        return self.wsgi(environ, start_response)
-
-    def run(self, host='0.0.0.0', port=8080, debug=None):
-        self._debug = debug if debug is not None else self._debug
-        from tornado import wsgi, httpserver, ioloop
-        httpserver.HTTPServer(wsgi.WSGIContainer(self.wsgi)).listen(port, host)
-        ioloop_ins = ioloop.IOLoop.instance()
-        if self._debug:
-            from tornado import autoreload, log
-            log.enable_pretty_logging()
-            autoreload.start(ioloop_ins)
-        ioloop_ins.start()
+    def run(self, host='0.0.0.0', port=8080, debug=False):
+        self._debug = debug
+        import uvicorn
+        uvicorn.run(self.asgi, host=host, port=port, interface='asgi3')
 
     def map(self, endpoint, rclass):
         self._mappings[endpoint] = rclass
@@ -394,9 +466,7 @@ class RestApp(object):
                 self.map(endpoint, as_class(func_or_class, method))
             else:
                 self.map(endpoint, func_or_class)
-
             return func_or_class
-
         return decorator
 
     def to_id(self, s):
@@ -440,7 +510,7 @@ class RestApp(object):
 
         return endpoint, method_override, extra_params
 
-    def request(self, method, path, params=None, context=None):
+    async def request(self, method, path, params=None, context=None):
         params = params or {}
         endpoint, method_override, extra_params = self.extract_path(path)
         rclass = self._mappings.get(endpoint)
@@ -474,13 +544,16 @@ class RestApp(object):
         result, error = None, None
         try:
             result = to_call(**params)
+            if inspect.iscoroutine(result):
+                result = await result
         except StrongTypeError as ex:
             error = self._params_error(ex.detail)
         except RestError as ex:
             error = ex
+            result = None
         except Exception as ex:
             if isinstance(ex, TypeError) and \
-                'required positional argument' in str(ex):
+                    'required positional argument' in str(ex):
                 error = self._params_error(str(ex))
             else:
                 ex_detail = traceback.format_exc()
@@ -492,7 +565,13 @@ class RestApp(object):
                     self.ex_callback(ex_detail)
 
         if result is None and error is None:
+            print(method, to_call, params)
             error = self._noapi_error('No Such API Result')
+
+        if inspect.isgenerator(result) or inspect.isasyncgen(result):
+            return result
+        if error is None and isinstance(result, (str, bytes)):
+            return result
 
         extra_result = getattr(rc, 'extra_result', None)
         response = self.make_response(result, extra_result, error)
@@ -500,7 +579,6 @@ class RestApp(object):
 
 
 class RestClient(object):
-
     def __init__(self, base_url, headers=None, inject_params=None):
         import requests
         self._base_url = base_url.rstrip('/')
@@ -527,7 +605,7 @@ class RestClient(object):
                 data=data,
                 headers=self._headers
             ).json()
-        except:
+        except Exception:
             resp = {}
 
         return resp
